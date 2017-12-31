@@ -66,10 +66,10 @@ typedef void MonoMemPool;
 typedef void GSList;
 typedef void LastCallerInfo;
 
-typedef struct _MonoType MonoType;
-typedef struct _MonoClass MonoClass;
-typedef struct _MonoMethod MonoMethod;
-typedef struct _MonoProfiler MonoProfiler;
+struct MonoType;
+struct MonoClass;
+struct MonoMethod;
+struct MonoProfiler;
 
 
 typedef enum {
@@ -170,7 +170,7 @@ typedef struct {
 	unsigned int token : 31;
 } MonoCustomMod;
 
-struct _MonoType {
+struct MonoType {
 	union {
 		MonoClass *klass; /* for VALUETYPE and CLASS */
 		MonoType *type;   /* for PTR */
@@ -192,7 +192,7 @@ typedef struct {
 	MonoThreadsSync *synchronisation;
 } MonoObject;
 
-struct _MonoClass {
+struct MonoClass {
 	/* element class for arrays and enum basetype for enums */
 	MonoClass *element_class;
 	/* used for subtype checks */
@@ -330,7 +330,7 @@ struct _MonoClass {
 	void *user_data;
 };
 
-struct _MonoMethod {
+struct MonoMethod {
 	guint16 flags;  /* method flags */
 	guint16 iflags; /* method implementation flags */
 	guint32 token;
@@ -359,7 +359,7 @@ struct _MonoMethod {
 	*/
 };
 
-struct _MonoProfiler {
+struct MonoProfiler {
 	GHashTable *methods;
 	MonoMemPool *mempool;
 	GSList *domains;
