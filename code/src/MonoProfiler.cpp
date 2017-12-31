@@ -50,7 +50,6 @@ static MonoMethodAllocationMap monoMethodAllocations;
 static MonoMethodAllocationMap::const_iterator itMethod;
 static MonoObjectAllocationMap::const_iterator itObject;
 
-static MonoProfilerInstallFunc mono_profiler_install = NULL;
 static MonoProfilerInstallEnterLeaveFunc mono_profiler_install_enter_leave = NULL;
 static MonoProfilerSetEventsFunc mono_profiler_set_events = NULL;
 static MonoProfilerInstallGCFunc mono_profiler_install_gc = NULL;
@@ -93,14 +92,6 @@ static void DebugOut(const char *szFormat, ...)
 		printf(szBuffer);
 	}
 	va_end(vaList);
-}
-
-//
-// 调试关闭回调
-//
-static void profiler_shutdown(MonoProfiler *prof)
-{
-	LOG("profiler_shutdown\n");
 }
 
 //
@@ -152,7 +143,7 @@ static void sample_method_leave(MonoProfiler *prof, MonoMethod *method)
 //
 // 内存分配回调
 //
-static void simple_allocation(MonoProfiler *prof, MonoObject *obj, MonoClass *klass)
+static void sample_allocation(MonoProfiler *prof, MonoObject *obj, MonoClass *klass)
 {
 	EnterCriticalSection(mutex);
 	{
@@ -214,17 +205,15 @@ EXPORT_API void Init(const char *szMonoModuleName)
 		bObjectIterator = false;
 
 		if (HMODULE hMonoLibrary = LoadLibrary(szMonoModuleName)) {
-			mono_profiler_install = (MonoProfilerInstallFunc)GetProcAddress(hMonoLibrary, "mono_profiler_install");
 			mono_profiler_install_enter_leave = (MonoProfilerInstallEnterLeaveFunc)GetProcAddress(hMonoLibrary, "mono_profiler_install_enter_leave");
 			mono_profiler_set_events = (MonoProfilerSetEventsFunc)GetProcAddress(hMonoLibrary, "mono_profiler_set_events");
 			mono_profiler_install_gc = (MonoProfilerInstallGCFunc)GetProcAddress(hMonoLibrary, "mono_profiler_install_gc");
 			mono_profiler_install_allocation = (MonoProfilerInstallAllocation)GetProcAddress(hMonoLibrary, "mono_profiler_install_allocation");
 			mono_object_get_size = (MonoObjectGetSize)GetProcAddress(hMonoLibrary, "mono_object_get_size");
 
-			mono_profiler_install(&monoProfiler, profiler_shutdown);
 			mono_profiler_install_gc(gc_event, gc_resize);
 			mono_profiler_install_enter_leave(sample_method_enter, sample_method_leave);
-			mono_profiler_install_allocation(simple_allocation);
+			mono_profiler_install_allocation(sample_allocation);
 			mono_profiler_set_events((MonoProfileFlags)(MONO_PROFILE_ALLOCATIONS | MONO_PROFILE_GC | MONO_PROFILE_ENTER_LEAVE));
 		}
 		else {
