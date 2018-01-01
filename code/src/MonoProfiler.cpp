@@ -62,6 +62,7 @@ typedef guint(*MonoObjectGetSize)(MonoObject* o);
 
 static PRTL_CRITICAL_SECTION mutex = NULL;
 
+static bool bPause = true;
 static MethodStackMap methodStacks;
 static MethodSampleMap methodSamples;
 
@@ -137,6 +138,10 @@ static void gc_resize(MonoProfiler *prof, gint64 new_size)
 
 static void sample_method_enter(MonoProfiler *prof, MonoMethod *method)
 {
+	if (bPause) {
+		return;
+	}
+
 	EnterCriticalSection(mutex);
 	{
 		char name[260];
@@ -159,6 +164,10 @@ static void sample_method_enter(MonoProfiler *prof, MonoMethod *method)
 
 static void sample_method_leave(MonoProfiler *prof, MonoMethod *method)
 {
+	if (bPause) {
+		return;
+	}
+
 	EnterCriticalSection(mutex);
 	{
 		char name[260];
@@ -182,6 +191,10 @@ static void sample_method_leave(MonoProfiler *prof, MonoMethod *method)
 
 static void sample_allocation(MonoProfiler *prof, MonoObject *obj, MonoClass *klass)
 {
+	if (bPause) {
+		return;
+	}
+
 	EnterCriticalSection(mutex);
 	{
 		char name[260];
@@ -236,10 +249,14 @@ EXPORT_API void Init(const char *szMonoModuleName)
 	LeaveCriticalSection(mutex);
 
 	Clear();
+
+	bPause = false;
 }
 
 EXPORT_API void Clear(void)
 {
+	bPause = true;
+
 	EnterCriticalSection(mutex);
 	{
 		for (const auto &itThreadMethodSamples : methodSamples) {
