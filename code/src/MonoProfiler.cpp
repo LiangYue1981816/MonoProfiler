@@ -349,7 +349,6 @@ EXPORT_API void Dump(const char *szDumpFileName, bool bDetails)
 										pObjectNode->SetAttributeString("name", itAllocationSample.second->name);
 										pObjectNode->SetAttributeInt("size", itAllocationSample.second->dwMemorySize);
 										pObjectNode->SetAttributeInt("count", itAllocationSample.second->dwCount);
-
 									}
 									pMethodNode->LinkEndChild(pObjectNode);
 								}
