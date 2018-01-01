@@ -30,7 +30,7 @@ public class MonoProfilerEditor : Editor
     }
 
     [@MenuItem("MonoProfiler/Dump Details")]
-    public static void MonoProfilerDump()
+    public static void MonoProfilerDumpDetails()
     {
         Dump("dump_details.xml", true);
     }
