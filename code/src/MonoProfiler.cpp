@@ -308,7 +308,7 @@ EXPORT_API void Dump(const char *szDumpFileName, bool bDetails)
 						TiXmlElement *pMethodNode = new TiXmlElement("Method");
 						{
 							pMethodNode->SetAttributeString("name", itMethodSample->name);
-							pMethodNode->SetAttributeFloat("total time", itMethodSample->dwTime / 1000000.0f);
+							pMethodNode->SetAttributeFloat("total_time", itMethodSample->dwTime / 1000000.0f);
 							pMethodNode->SetAttributeFloat("time", itMethodSample->dwTime / 1000000.0f / itMethodSample->dwCount);
 							pMethodNode->SetAttributeInt("calls", itMethodSample->dwCount);
 
