@@ -1,38 +1,59 @@
 #include "_MonoProfiler.h"
 
 
-#define ENABLE_LOG 0
-#define OUTPUT_FILENAME "x:\\MonoProfiler.txt"
-
-#if ENABLE_LOG == 1
-#   define LOG(...) DebugOut(__VA_ARGS__)
-#else
-#   define LOG(...) 
-#endif
+#define LOG DebugOut
 
 
-struct MethodAllocation {
-	MonoMethod* method;
-	unsigned int allocated;
-	unsigned int allocatedLast;
+typedef struct AllocationSample {
+	AllocationSample(const char *_name)
+		: name{ 0 }
+		, dwCount(0)
+		, dwMemorySize(0)
+	{
+		strcpy(name, _name);
+	}
 
-	std::string stack;
-	std::map<MonoClass*, guint> objects;
-};
+	char name[260];
 
-typedef std::map<DWORD, std::stack<MonoMethod*>> MonoMethodStackMap;
-typedef std::map<DWORD, MethodAllocation* > MonoMethodAllocationMap;
-typedef std::map<MonoClass*, guint> MonoObjectAllocationMap;
+	DWORD dwCount;
+	DWORD dwMemorySize;
+} AllocationSample;
 
-typedef void(*MonoProfileFunc)(MonoProfiler *prof);
+typedef struct MethodSample {
+	MethodSample(const char *_name)
+		: pParent(NULL)
+		, name{ 0 }
+		, dwTime(0)
+		, dwCount(0)
+		, dwMemorySize(0)
+		, dwTick(0)
+	{
+		strcpy(name, _name);
+	}
+
+	MethodSample *pParent;
+
+	char name[260];
+
+	DWORD dwTick;
+	DWORD dwTime;
+	DWORD dwCount;
+	DWORD dwMemorySize;
+
+	std::map<DWORD, AllocationSample*> alloctions;
+} MethodSample;
+
+typedef std::map<DWORD, std::stack<std::string>> MethodStackMap; // [ThreadID, Method Stack]
+typedef std::map<DWORD, std::map<DWORD, MethodSample*>> MethodSampleMap; // [ThreadID, Method Stack Hash, Method Sample]
+
+
 typedef void(*MonoProfileMethodFunc)(MonoProfiler *prof, MonoMethod *method);
 typedef void(*MonoProfileGCFunc)(MonoProfiler *prof, MonoGCEvent event, int generation);
 typedef void(*MonoProfileGCResizeFunc)(MonoProfiler *prof, gint64 new_size);
 typedef void(*MonoProfileAllocFunc)(MonoProfiler *prof, MonoObject *obj, MonoClass *klass);
 
 
-typedef void(*MonoProfilerInstallFunc)(MonoProfiler *prof, MonoProfileFunc callback);
-typedef void(*MonoProfilerInstallEnterLeaveFunc)(MonoProfileMethodFunc enter, MonoProfileMethodFunc fleave);
+typedef void(*MonoProfilerInstallEnterLeaveFunc)(MonoProfileMethodFunc enter, MonoProfileMethodFunc leave);
 typedef void(*MonoProfilerSetEventsFunc)(MonoProfileFlags events);
 typedef void(*MonoProfilerInstallGCFunc)(MonoProfileGCFunc callback, MonoProfileGCResizeFunc heap_resize_callback);
 typedef void(*MonoProfilerInstallAllocation)(MonoProfileAllocFunc callback);
@@ -41,14 +62,8 @@ typedef guint(*MonoObjectGetSize)(MonoObject* o);
 
 static PRTL_CRITICAL_SECTION mutex = NULL;
 
-static bool bPause = true;
-static bool bMethodIterator = false;
-static bool bObjectIterator = false;
-static MonoProfiler monoProfiler;
-static MonoMethodStackMap monoMethodStacks;
-static MonoMethodAllocationMap monoMethodAllocations;
-static MonoMethodAllocationMap::const_iterator itMethod;
-static MonoObjectAllocationMap::const_iterator itObject;
+static MethodStackMap methodStacks;
+static MethodSampleMap methodSamples;
 
 static MonoProfilerInstallEnterLeaveFunc mono_profiler_install_enter_leave = NULL;
 static MonoProfilerSetEventsFunc mono_profiler_set_events = NULL;
@@ -57,9 +72,17 @@ static MonoProfilerInstallAllocation mono_profiler_install_allocation = NULL;
 static MonoObjectGetSize mono_object_get_size = NULL;
 
 
-//
-// 计算Hash
-//
+static unsigned int tick(void)
+{
+	LARGE_INTEGER freq;
+	LARGE_INTEGER count;
+
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&count);
+
+	return (unsigned int)(((double)count.QuadPart / freq.QuadPart) * 1000000);
+}
+
 static DWORD HashValue(const char *szString)
 {
 	const char *c = szString;
@@ -73,9 +96,6 @@ static DWORD HashValue(const char *szString)
 	return dwHashValue;
 }
 
-//
-// 调试输出
-//
 static void DebugOut(const char *szFormat, ...)
 {
 	va_list vaList;
@@ -83,115 +103,112 @@ static void DebugOut(const char *szFormat, ...)
 	{
 		char szBuffer[1024];
 		vsprintf(szBuffer, szFormat, vaList);
-
-		if (FILE *pFile = fopen(OUTPUT_FILENAME, "a+")) {
-			fprintf(pFile, szBuffer);
-			fclose(pFile);
-		}
-
-		printf(szBuffer);
+		OutputDebugString(szBuffer);
 	}
 	va_end(vaList);
 }
 
-//
-// GC事件回调
-//
+static DWORD GetMethodStackHash(DWORD dwThreadID)
+{
+	if (methodStacks.find(dwThreadID) == methodStacks.end()) {
+		return 0;
+	}
+
+	std::string name = "";
+	std::stack<std::string> methods = methodStacks[dwThreadID];
+
+	while (methods.empty() == false) {
+		name += methods.top();
+		methods.pop();
+	}
+
+	return HashValue(name.c_str());
+}
+
 static void gc_event(MonoProfiler *prof, MonoGCEvent event, int generation)
 {
 	LOG("gc_event\n");
 }
 
-//
-// GC触发回调
-//
 static void gc_resize(MonoProfiler *prof, gint64 new_size)
 {
 	LOG("gc_resize %d\n", new_size);
 }
 
-//
-// 函数开始调用回调
-//
 static void sample_method_enter(MonoProfiler *prof, MonoMethod *method)
 {
 	EnterCriticalSection(mutex);
 	{
-		DWORD threadid = GetCurrentThreadId();
-		monoMethodStacks[threadid].push(method);
-		LOG("method_enter %s.%s\n", method->klass->name, method->name);
+		char name[260];
+		sprintf(name, "%s::%s::%s", method->klass->name_space, method->klass->name, method->name);
+
+		DWORD dwThreadID = GetCurrentThreadId();
+		DWORD dwParentMethod = GetMethodStackHash(dwThreadID); methodStacks[dwThreadID].push(name);
+		DWORD dwCurrentMethod = GetMethodStackHash(dwThreadID);
+
+		if (methodSamples[dwThreadID][dwCurrentMethod] == NULL) {
+			methodSamples[dwThreadID][dwCurrentMethod] = new MethodSample(name);
+			methodSamples[dwThreadID][dwCurrentMethod]->pParent = methodSamples[dwThreadID].find(dwParentMethod) != methodSamples[dwThreadID].end() ? methodSamples[dwThreadID][dwParentMethod] : NULL;
+		}
+
+		methodSamples[dwThreadID][dwCurrentMethod]->dwTick = tick();
+		methodSamples[dwThreadID][dwCurrentMethod]->dwCount++;
 	}
 	LeaveCriticalSection(mutex);
 }
 
-//
-// 函数结束调用回调
-//
 static void sample_method_leave(MonoProfiler *prof, MonoMethod *method)
 {
 	EnterCriticalSection(mutex);
 	{
-		DWORD threadid = GetCurrentThreadId();
-		if (monoMethodStacks[threadid].empty() == false) {
-			monoMethodStacks[threadid].pop();
+		char name[260];
+		sprintf(name, "%s::%s::%s", method->klass->name_space, method->klass->name, method->name);
+
+		DWORD dwThreadID = GetCurrentThreadId();
+		DWORD dwCurrentMethod = GetMethodStackHash(dwThreadID);
+
+		if (methodSamples.find(dwThreadID) != methodSamples.end()) {
+			if (methodStacks[dwThreadID].empty() == false && methodStacks[dwThreadID].top() == name) {
+				methodStacks[dwThreadID].pop();
+			}
+
+			if (methodSamples[dwThreadID].find(dwCurrentMethod) != methodSamples[dwThreadID].end()) {
+				methodSamples[dwThreadID][dwCurrentMethod]->dwTime += tick() - methodSamples[dwThreadID][dwCurrentMethod]->dwTick;
+			}
 		}
-		LOG("method_leave %s.%s\n", method->klass->name, method->name);
 	}
 	LeaveCriticalSection(mutex);
 }
 
-//
-// 内存分配回调
-//
 static void sample_allocation(MonoProfiler *prof, MonoObject *obj, MonoClass *klass)
 {
 	EnterCriticalSection(mutex);
 	{
-		if (bPause == false) {
-			DWORD threadid = GetCurrentThreadId();
-			guint size = mono_object_get_size(obj);
+		char name[260];
+		sprintf(name, "%s::%s", klass->name_space, klass->name);
 
-			if (monoMethodStacks[threadid].empty() == false) {
-				std::string stack = "";
-				std::stack<MonoMethod*> call = monoMethodStacks[threadid];
-				do {
-					MonoMethod *method = call.top(); call.pop();
+		DWORD dwThreadID = GetCurrentThreadId();
+		DWORD dwCurrentMethod = GetMethodStackHash(dwThreadID);
 
-					static char szBuffer[1024];
-					sprintf(szBuffer, "%s\n%s.%s", stack.c_str(), method->klass->name, method->name);
-					stack = szBuffer;
-				} while (call.empty() == false);
+		DWORD dwObjectName = HashValue(name);
+		DWORD dwObjectSize = mono_object_get_size(obj);
 
-				DWORD dwHash = HashValue(stack.c_str());
-				MethodAllocation *pMethodAllocation = monoMethodAllocations[dwHash];
-
-				if (pMethodAllocation == NULL) {
-					pMethodAllocation = new MethodAllocation;
-					pMethodAllocation->stack = stack;
-					pMethodAllocation->method = monoMethodStacks[threadid].top();
-					pMethodAllocation->allocated = 0;
-					pMethodAllocation->allocatedLast = 0;
-					monoMethodAllocations[dwHash] = pMethodAllocation;
-				}
-
-				pMethodAllocation->allocated += size;
-				pMethodAllocation->objects[klass] += size;
+		if (methodSamples.find(dwThreadID) != methodSamples.end() && 
+			methodSamples[dwThreadID].find(dwCurrentMethod) != methodSamples[dwThreadID].end()) {
+			if (methodSamples[dwThreadID][dwCurrentMethod]->alloctions[dwObjectName] == NULL) {
+				methodSamples[dwThreadID][dwCurrentMethod]->alloctions[dwObjectName] = new AllocationSample(name);
+				methodSamples[dwThreadID][dwCurrentMethod]->alloctions[dwObjectName]->dwMemorySize = dwObjectSize;
 			}
 
-			LOG("allocation %s: %d\n", klass->name, size);
+			methodSamples[dwThreadID][dwCurrentMethod]->dwMemorySize += dwObjectSize;
+			methodSamples[dwThreadID][dwCurrentMethod]->alloctions[dwObjectName]->dwCount++;
 		}
 	}
 	LeaveCriticalSection(mutex);
 }
 
-//
-// 初始化调试器
-//
 EXPORT_API void Init(const char *szMonoModuleName)
 {
-	//
-	// 1. 初始化调试器
-	//
 	if (mutex == NULL) {
 		mutex = (PRTL_CRITICAL_SECTION)malloc(sizeof(RTL_CRITICAL_SECTION));
 		memset(mutex, 0, sizeof(RTL_CRITICAL_SECTION));
@@ -200,10 +217,6 @@ EXPORT_API void Init(const char *szMonoModuleName)
 
 	EnterCriticalSection(mutex);
 	{
-		bPause = true;
-		bMethodIterator = false;
-		bObjectIterator = false;
-
 		if (HMODULE hMonoLibrary = LoadLibrary(szMonoModuleName)) {
 			mono_profiler_install_enter_leave = (MonoProfilerInstallEnterLeaveFunc)GetProcAddress(hMonoLibrary, "mono_profiler_install_enter_leave");
 			mono_profiler_set_events = (MonoProfilerSetEventsFunc)GetProcAddress(hMonoLibrary, "mono_profiler_set_events");
@@ -222,324 +235,117 @@ EXPORT_API void Init(const char *szMonoModuleName)
 	}
 	LeaveCriticalSection(mutex);
 
-	//
-	// 2. 清空记录的信息
-	//
 	Clear();
-	remove(OUTPUT_FILENAME);
 }
 
-//
-// 暂停
-//
-EXPORT_API void Pause(void)
-{
-	EnterCriticalSection(mutex);
-	{
-		bPause = true;
-	}
-	LeaveCriticalSection(mutex);
-}
-
-//
-// 继续
-//
-EXPORT_API void Resume(void)
-{
-	EnterCriticalSection(mutex);
-	{
-		bPause = false;
-	}
-	LeaveCriticalSection(mutex);
-}
-
-//
-// 清空记录的信息
-//
 EXPORT_API void Clear(void)
 {
 	EnterCriticalSection(mutex);
 	{
-		for (MonoMethodStackMap::iterator it = monoMethodStacks.begin(); it != monoMethodStacks.end(); ++it) {
-			while (it->second.empty() == false) it->second.pop();
+		for (const auto &itThreadMethodSamples : methodSamples) {
+			for (const auto &itMethodSample : itThreadMethodSamples.second) {
+				if (itMethodSample.second) {
+					for (const auto &itAllocationSample : itMethodSample.second->alloctions) {
+						if (itAllocationSample.second) {
+							delete itAllocationSample.second;
+						}
+					}
+					delete itMethodSample.second;
+				}
+			}
 		}
 
-		for (MonoMethodAllocationMap::iterator it = monoMethodAllocations.begin(); it != monoMethodAllocations.end(); ++it) {
-			delete it->second;
-		}
-
-		monoMethodStacks.clear();
-		monoMethodAllocations.clear();
+		methodStacks.clear();
+		methodSamples.clear();
 	}
 	LeaveCriticalSection(mutex);
 }
 
-//
-// Dump
-//
-EXPORT_API void Dump(const char *szDumpFileName)
+EXPORT_API void Dump(const char *szDumpFileName, bool bDetails)
 {
 	EnterCriticalSection(mutex);
 	{
-		if (FILE *pFile = fopen(szDumpFileName, "wb")) {
-			for (MonoMethodAllocationMap::const_iterator it = monoMethodAllocations.begin(); it != monoMethodAllocations.end(); ++it) {
-				fprintf(pFile, "%s.%s\t\t%d\n", it->second->method->klass->name, it->second->method->name, it->second->allocated);
-			}
+		std::map<DWORD, std::vector<MethodSample*>> methodSampleByTime;
+		std::map<DWORD, std::vector<MethodSample*>> methodSampleByMemory;
 
-			fclose(pFile);
-		}
-	}
-	LeaveCriticalSection(mutex);
-}
-
-//
-// 开始方法迭代器
-//
-EXPORT_API void BeginMethodIterator(void)
-{
-	if (bMethodIterator == false) {
-		Pause();
-
-		EnterCriticalSection(mutex);
-		{
-			itMethod = monoMethodAllocations.begin();
-			bMethodIterator = true;
-		}
-		LeaveCriticalSection(mutex);
-	}
-}
-
-//
-// 方法迭代
-//
-EXPORT_API bool NextMethodIterator(void)
-{
-	bool bNext = false;
-
-	if (bMethodIterator) {
-		Pause();
-
-		EnterCriticalSection(mutex);
-		{
-			if (itMethod != monoMethodAllocations.end()) {
-				bNext = ++itMethod != monoMethodAllocations.end();
-			}
-		}
-		LeaveCriticalSection(mutex);
-	}
-
-	return bNext;
-}
-
-//
-// 终止方法迭代器
-//
-EXPORT_API void EndMethodIterator(void)
-{
-	if (bMethodIterator) {
-		Pause();
-
-		EnterCriticalSection(mutex);
-		{
-			itMethod = monoMethodAllocations.end();
-			bMethodIterator = false;
-		}
-		LeaveCriticalSection(mutex);
-	}
-}
-
-//
-// 获得方法名
-//
-EXPORT_API const char* GetMethodName(void)
-{
-	static char szMethodName[1024];
-	memset(szMethodName, 0, sizeof(szMethodName));
-
-	if (bMethodIterator) {
-		EnterCriticalSection(mutex);
-		{
-			if (itMethod != monoMethodAllocations.end()) {
-				sprintf(szMethodName, "%s.%s", itMethod->second->method->klass->name, itMethod->second->method->name);
-			}
-		}
-		LeaveCriticalSection(mutex);
-	}
-
-	return szMethodName;
-}
-
-//
-// 获得方法调用栈
-//
-EXPORT_API const char* GetMethodCallStack(void)
-{
-	static char szMethodCallStack[1024];
-	memset(szMethodCallStack, 0, sizeof(szMethodCallStack));
-
-	if (bMethodIterator) {
-		EnterCriticalSection(mutex);
-		{
-			if (itMethod != monoMethodAllocations.end()) {
-				sprintf(szMethodCallStack, "%s", itMethod->second->stack.c_str());
-			}
-		}
-		LeaveCriticalSection(mutex);
-	}
-
-	return szMethodCallStack;
-}
-
-//
-// 获得方法分配的内存数
-//
-EXPORT_API unsigned int GetMethodAllocSize(void)
-{
-	unsigned int size = 0;
-
-	if (bMethodIterator) {
-		EnterCriticalSection(mutex);
-		{
-			if (itMethod != monoMethodAllocations.end()) {
-				size = itMethod->second->allocated;
-			}
-		}
-		LeaveCriticalSection(mutex);
-	}
-
-	return size;
-}
-
-//
-// 获得方法分配变化的内存数
-//
-EXPORT_API unsigned int GetMethodAllocSizeDelta(void)
-{
-	unsigned int size = 0;
-
-	if (bMethodIterator) {
-		EnterCriticalSection(mutex);
-		{
-			if (itMethod != monoMethodAllocations.end()) {
-				size = itMethod->second->allocated - itMethod->second->allocatedLast;
-				itMethod->second->allocatedLast = itMethod->second->allocated;
-			}
-		}
-		LeaveCriticalSection(mutex);
-	}
-
-	return size;
-}
-
-//
-// 开始对象迭代器
-//
-EXPORT_API void BeginObjectIterator(void)
-{
-	if (bMethodIterator) {
-		if (bObjectIterator == false) {
-			Pause();
-
-			EnterCriticalSection(mutex);
-			{
-				if (itMethod != monoMethodAllocations.end()) {
-					itObject = itMethod->second->objects.begin();
-					bObjectIterator = true;
-				}
-			}
-			LeaveCriticalSection(mutex);
-		}
-	}
-}
-
-//
-// 对象迭代
-//
-EXPORT_API bool NextObjectIterator(void)
-{
-	bool bNext = false;
-
-	if (bMethodIterator) {
-		if (bObjectIterator) {
-			Pause();
-
-			EnterCriticalSection(mutex);
-			{
-				if (itMethod != monoMethodAllocations.end()) {
-					if (itObject != itMethod->second->objects.end()) {
-						bNext = ++itObject != itMethod->second->objects.end();
+		for (const auto &itThreadMethodSamples : methodSamples) {
+			for (const auto &itMethodSample : itThreadMethodSamples.second) {
+				if (itMethodSample.second) {
+					if (itMethodSample.second->dwTime > 0) {
+						methodSampleByTime[itMethodSample.second->dwTime].push_back(itMethodSample.second);
+					}
+					if (itMethodSample.second->dwMemorySize > 0) {
+						methodSampleByMemory[itMethodSample.second->dwMemorySize].push_back(itMethodSample.second);
 					}
 				}
 			}
-			LeaveCriticalSection(mutex);
 		}
-	}
 
-	return bNext;
-}
-
-//
-// 终止对象迭代器
-//
-EXPORT_API void EndObjectIterator(void)
-{
-	if (bMethodIterator) {
-		if (bObjectIterator) {
-			Pause();
-
-			EnterCriticalSection(mutex);
+		TiXmlDocument doc;
+		TiXmlElement *pReportNode = new TiXmlElement("Report");
+		{
+			TiXmlElement *pTimeNode = new TiXmlElement("Time");
 			{
-				if (itMethod != monoMethodAllocations.end()) {
-					itObject = itMethod->second->objects.end();
-					bObjectIterator = false;
+				for (std::map<DWORD, std::vector<MethodSample*>>::const_reverse_iterator itMethodSamples = methodSampleByTime.rbegin(); itMethodSamples != methodSampleByTime.rend(); itMethodSamples++) {
+					for (const auto &itMethodSample : itMethodSamples->second) {
+						TiXmlElement *pMethodNode = new TiXmlElement("Method");
+						{
+							pMethodNode->SetAttributeString("name", itMethodSample->name);
+							pMethodNode->SetAttributeFloat("total time", itMethodSample->dwTime / 1000000.0f);
+							pMethodNode->SetAttributeFloat("time", itMethodSample->dwTime / 1000000.0f / itMethodSample->dwCount);
+							pMethodNode->SetAttributeInt("calls", itMethodSample->dwCount);
+
+							if (bDetails) {
+								if (MethodSample *pParent = itMethodSample->pParent) {
+									do {
+										TiXmlElement *pStackNode = new TiXmlElement("CallStack");
+										{
+											pStackNode->SetAttributeString("name", pParent->name);
+											pStackNode->SetAttributeFloat("total_time", pParent->dwTime / 1000000.0f);
+											pStackNode->SetAttributeFloat("time", pParent->dwTime / 1000000.0f / pParent->dwCount);
+										}
+										pMethodNode->LinkEndChild(pStackNode);
+									} while (pParent = pParent->pParent);
+								}
+							}
+						}
+						pTimeNode->LinkEndChild(pMethodNode);
+					}
 				}
 			}
-			LeaveCriticalSection(mutex);
-		}
-	}
-}
+			pReportNode->LinkEndChild(pTimeNode);
 
-//
-// 获得对象名
-//
-EXPORT_API const char* GetObjectName(void)
-{
-	static char szObjectName[1024];
-	memset(szObjectName, 0, sizeof(szObjectName));
-
-	if (bMethodIterator) {
-		if (bObjectIterator) {
-			EnterCriticalSection(mutex);
+			TiXmlElement *pMemoryNode = new TiXmlElement("Memory");
 			{
-				if (itObject != itMethod->second->objects.end()) {
-					sprintf(szObjectName, "%s", itObject->first->name);
+				for (std::map<DWORD, std::vector<MethodSample*>>::const_reverse_iterator itMethodSamples = methodSampleByMemory.rbegin(); itMethodSamples != methodSampleByMemory.rend(); itMethodSamples++) {
+					for (const auto &itMethodSample : itMethodSamples->second) {
+						TiXmlElement *pMethodNode = new TiXmlElement("Method");
+						{
+							pMethodNode->SetAttributeString("name", itMethodSample->name);
+							pMethodNode->SetAttributeInt("total_size", itMethodSample->dwMemorySize);
+							pMethodNode->SetAttributeInt("calls", itMethodSample->dwCount);
+
+							if (bDetails) {
+								for (const auto &itAllocationSample : itMethodSample->alloctions) {
+									TiXmlElement *pObjectNode = new TiXmlElement("Object");
+									{
+										pObjectNode->SetAttributeString("name", itAllocationSample.second->name);
+										pObjectNode->SetAttributeInt("size", itAllocationSample.second->dwMemorySize);
+										pObjectNode->SetAttributeInt("count", itAllocationSample.second->dwCount);
+
+									}
+									pMethodNode->LinkEndChild(pObjectNode);
+								}
+							}
+						}
+						pMemoryNode->LinkEndChild(pMethodNode);
+					}
 				}
 			}
-			LeaveCriticalSection(mutex);
+			pReportNode->LinkEndChild(pMemoryNode);
 		}
+		doc.LinkEndChild(pReportNode);
+		doc.SaveFile(szDumpFileName);
 	}
-
-	return szObjectName;
-}
-
-//
-// 获得对象分配的内存数
-//
-EXPORT_API unsigned int GetObjectAllocSize(void)
-{
-	unsigned int size = 0;
-
-	if (bMethodIterator) {
-		if (bObjectIterator) {
-			EnterCriticalSection(mutex);
-			{
-				if (itObject != itMethod->second->objects.end()) {
-					size = itObject->second;
-				}
-			}
-			LeaveCriticalSection(mutex);
-		}
-	}
-
-	return size;
+	LeaveCriticalSection(mutex);
 }

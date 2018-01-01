@@ -4,6 +4,8 @@
 #include <map>
 #include <stack>
 #include <vector>
+#include "tinyxml.h"
+#include "tinystr.h"
 #include "MonoProfiler.h"
 
 

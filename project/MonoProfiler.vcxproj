@@ -189,6 +189,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\code\src\MonoProfiler.cpp" />
+    <ClCompile Include="..\code\src\tinystr.cpp" />
+    <ClCompile Include="..\code\src\tinyxml.cpp" />
+    <ClCompile Include="..\code\src\tinyxmlerror.cpp" />
+    <ClCompile Include="..\code\src\tinyxmlparser.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
